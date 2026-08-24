@@ -547,4 +547,33 @@ describe("openai-completions convertMessages", () => {
 			},
 		]);
 	});
+	it("preserves image_url for the bundled DeepSeek V4 Flash Vision model", () => {
+		// Regression for #9595: the text-only DeepSeek guard must not strip images
+		// from a genuinely multimodal DeepSeek SKU declaring `input: [text, image]`.
+		const model = getBundledModel("deepseek", "deepseek-v4-flash-vision-exp") as Model<"openai-completions">;
+		expect(model.input).toContain("image");
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "Describe this screenshot" },
+						{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+					],
+					timestamp: Date.now(),
+				},
+			],
+		};
+
+		const messages = convertMessages(model, context, compat);
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0].content).toEqual([
+			{ type: "text", text: "Describe this screenshot" },
+			{
+				type: "image_url",
+				image_url: { url: "data:image/png;base64,ZmFrZQ==" },
+			},
+		]);
+	});
 });
