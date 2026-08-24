@@ -6,6 +6,7 @@ import { Command } from "@oh-my-pi/pi-utils/cli";
 import { type Args as ParsedArgs, parseArgs, reportCliUsageError } from "../cli/args";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
+import { argsFromParkHandoff, loadParkHandoff } from "../session/parking-handoff";
 import { launchHelp } from "./launch-help";
 
 export default class Index extends Command {
@@ -22,6 +23,9 @@ export default class Index extends Command {
 		let parsed: ParsedArgs;
 		try {
 			parsed = parseArgs(args);
+			if (parsed.parkResume) {
+				parsed = argsFromParkHandoff(await loadParkHandoff(parsed.parkResume));
+			}
 		} catch (error) {
 			if (reportCliUsageError(error)) {
 				process.exitCode = 2;

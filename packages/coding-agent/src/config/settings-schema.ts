@@ -495,6 +495,24 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"parking.idleSeconds": {
+		type: "number",
+		default: 900,
+		ui: {
+			tab: "interaction",
+			group: "Session",
+			label: "Idle Parking",
+			description: "Save and release an interactive session after this many idle seconds",
+			options: [
+				{ value: "0", label: "Disabled" },
+				{ value: "300", label: "5 minutes" },
+				{ value: "900", label: "15 minutes" },
+				{ value: "1800", label: "30 minutes" },
+				{ value: "3600", label: "1 hour" },
+			],
+		},
+	},
+
 	// Power assertions: macOS IOKit, Linux login1/ScreenSaver, Windows execution state.
 	"power.sleepPrevention": {
 		type: "enum",

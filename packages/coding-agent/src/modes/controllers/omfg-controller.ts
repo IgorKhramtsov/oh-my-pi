@@ -18,6 +18,7 @@ interface OmfgRequest {
 	component: OmfgPanelComponent;
 	abortController: AbortController;
 	complaint: string;
+	running: boolean;
 }
 
 interface OmfgCandidate extends ParsedGeneratedRule {
@@ -40,9 +41,12 @@ export class OmfgController {
 	#activeRequest: OmfgRequest | undefined;
 
 	constructor(private readonly ctx: InteractiveModeContext) {}
-
 	hasActiveRequest(): boolean {
 		return this.#activeRequest !== undefined;
+	}
+
+	hasRunningRequest(): boolean {
+		return this.#activeRequest?.running === true;
 	}
 
 	handleEscape(): boolean {
@@ -74,6 +78,7 @@ export class OmfgController {
 			component: new OmfgPanelComponent({ complaint: trimmedComplaint, tui: this.ctx.ui }),
 			abortController: new AbortController(),
 			complaint: trimmedComplaint,
+			running: true,
 		};
 		this.ctx.omfgContainer.clear();
 		this.ctx.omfgContainer.addChild(request.component);
@@ -125,6 +130,8 @@ export class OmfgController {
 				return;
 			}
 			request.component.markError(error instanceof Error ? error.message : String(error));
+		} finally {
+			request.running = false;
 		}
 	}
 

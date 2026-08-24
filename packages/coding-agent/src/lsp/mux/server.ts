@@ -10,6 +10,7 @@ import {
 	MUX_CONNECT_METHOD,
 	MUX_PING_METHOD,
 	MUX_PING_RESULT,
+	MUX_RELEASE_METHOD,
 	MUX_RESTART_METHOD,
 	type MuxConnectParams,
 	type MuxConnectResult,
@@ -71,6 +72,7 @@ class Session {
 	boundKey?: string;
 	initialized = false;
 	closed = false;
+	retainServerOnClose = true;
 	lastActivity = Date.now();
 
 	constructor(socket: net.Socket) {
@@ -342,6 +344,10 @@ export class LspMuxServer {
 		const server = session.server;
 		if (!server) {
 			if (request) this.#sendSession(session, rpcError(message.id, -32002, "muxConnect must be first"));
+			return;
+		}
+		if (message.method === MUX_RELEASE_METHOD && !request) {
+			session.retainServerOnClose = false;
 			return;
 		}
 		if (message.method === MUX_RESTART_METHOD && !request) {
@@ -661,9 +667,13 @@ export class LspMuxServer {
 			server.initializeWaiters.delete(session);
 			server.sessions.delete(session);
 			if (server.sessions.size === 0 && !server.stopping) {
-				server.lingerTimer = setTimeout(() => {
-					if (server.sessions.size === 0) void this.#stopServer(server);
-				}, SERVER_LINGER_MS);
+				if (session.retainServerOnClose) {
+					server.lingerTimer = setTimeout(() => {
+						if (server.sessions.size === 0) void this.#stopServer(server);
+					}, SERVER_LINGER_MS);
+				} else {
+					await this.#stopServer(server);
+				}
 			}
 		}
 		if (this.#sessions.size === 0) this.#armMuxIdle();

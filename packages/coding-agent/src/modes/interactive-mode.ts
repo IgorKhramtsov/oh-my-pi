@@ -114,6 +114,7 @@ import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionContext } from "../session/session-context";
 import { getRecentSessions } from "../session/session-listing";
 import type { SessionManager } from "../session/session-manager";
+import { SessionParkingController } from "../session/session-parking-controller";
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import { formatDuration } from "../slash-commands/helpers/format";
@@ -407,6 +408,12 @@ export interface InteractiveModeOptions {
 	initialImages?: ImageContent[];
 	/** Additional initial messages to queue */
 	initialMessages?: string[];
+	/** Optional launcher-owned idle parking lifecycle. */
+	parking?: {
+		idleMs: number;
+		warningMs: number;
+		park: (draft: string, signal: AbortSignal) => Promise<boolean>;
+	};
 }
 
 export const TODO_COMPACT_TERMINAL_ROWS_THRESHOLD = 18;
@@ -724,6 +731,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#autocompleteProviderFactories: AutocompleteProviderFactory[] = [];
 	#cleanupUnsubscribe?: () => void;
 	#signalTeardown?: SessionTeardown;
+	#parkingController?: SessionParkingController;
+	readonly #parkingOptions: InteractiveModeOptions["parking"];
 	readonly #version: string;
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	/** Header components below the config warnings + welcome, retained so a live config-warning change can rebuild the header (#10048). */
@@ -855,10 +864,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		eventBus?: EventBus,
 		composer?: Composer,
 		subagentEventBus?: EventBus,
+		parking?: InteractiveModeOptions["parking"],
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
+		this.#parkingOptions = parking;
 		const preferences = {
 			quiet: settings.get("startup.quiet"),
 			composerShape: settings.get("composer.shape") ?? "band",
@@ -1227,6 +1238,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.setFocus(this.editor);
 		this.syncComposerShape();
 
+		this.ui.addInputListener(() => {
+			this.#parkingController?.noteActivity();
+			return undefined;
+		});
+
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
 
@@ -1349,6 +1365,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribe(event => {
+				this.#parkingController?.noteActivity();
 				if (event.type === "model_changed") {
 					this.#updateWelcomeModel();
 				}
@@ -1362,6 +1379,28 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#handleSessionAccentInputsChanged();
 			}),
 		);
+		if (this.#parkingOptions) {
+			this.#parkingController = new SessionParkingController({
+				idleMs: this.#parkingOptions.idleMs,
+				warningMs: this.#parkingOptions.warningMs,
+				canPark: () => this.#canParkSession(),
+				onWarning: remainingMs => {
+					this.statusLine.setHookStatus(
+						"parking",
+						`Auto-parking in ${formatDuration(remainingMs)} — press any key to keep open`,
+					);
+					this.ui.requestRender();
+				},
+				onError: error =>
+					this.showError(`Could not park session: ${error instanceof Error ? error.message : String(error)}`),
+				onWarningCleared: () => {
+					this.statusLine.setHookStatus("parking", undefined);
+					this.ui.requestRender();
+				},
+				park: signal => this.#parkSession(signal),
+			});
+			this.#parkingController.start();
+		}
 		// Resync the welcome banner to the live model: init-time reconciliations
 		// (#reconcileModeFromSession, #enterPlanMode for plan.defaultOnStartup)
 		// can change the model before this subscription exists, so the
@@ -4755,7 +4794,46 @@ export class InteractiveMode implements InteractiveModeContext {
 		return choice === "Yes";
 	}
 
+	#canParkSession(): boolean {
+		if (
+			this.session.isStreaming ||
+			this.session.isAborting ||
+			this.session.isEvalRunning ||
+			this.session.isCompacting ||
+			this.session.isGeneratingHandoff ||
+			this.session.isRetrying ||
+			this.pendingTools.size > 0 ||
+			this.hookSelector !== undefined ||
+			this.hookInput !== undefined ||
+			this.hookEditor !== undefined ||
+			this.#planReviewOverlay !== undefined ||
+			this.agent.hasQueuedMessages() ||
+			this.collabHost !== undefined ||
+			this.collabGuest !== undefined ||
+			this.#liveCommandController.active ||
+			this.#btwController.hasRunningRequest() ||
+			this.#omfgController.hasRunningRequest() ||
+			this.#cleanseController.hasRunningRun()
+		) {
+			return false;
+		}
+		if ((this.session.getAsyncJobSnapshot()?.running.length ?? 0) > 0) return false;
+		return !this.#observerRegistry
+			.getSessions()
+			.some(session => session.kind === "subagent" && session.status === "active");
+	}
+
+	async #parkSession(signal: AbortSignal): Promise<boolean> {
+		const parking = this.#parkingOptions;
+		if (!parking) return false;
+		const committed = await parking.park(this.#inputController.getDraftText(), signal);
+		if (committed) await this.shutdown();
+		return committed;
+	}
+
 	stop(): void {
+		this.#parkingController?.stop();
+		this.#parkingController = undefined;
 		this.#appearanceRefreshRequest = undefined;
 		// Last chance to refresh the startup status placeholder for the next launch.
 		this.#persistComposerStatus();

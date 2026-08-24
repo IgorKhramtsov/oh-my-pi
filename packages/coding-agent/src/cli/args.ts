@@ -82,6 +82,12 @@ export interface Args {
 	noTitle?: boolean;
 	autoApprove?: boolean;
 	approvalMode?: "always-ask" | "write" | "yolo";
+	/** Internal exact-resume handoff emitted by the parking launcher. */
+	parkResume?: string;
+	/** Internal guard: the resume target must already contain a valid session header. */
+	strictResume?: boolean;
+	/** Internal token that claims a parked pane reservation. */
+	parkToken?: string;
 	messages: string[];
 	fileArgs: string[];
 	/** Extension-registered flags this parse recognized — name to value. */

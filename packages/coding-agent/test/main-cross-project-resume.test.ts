@@ -22,6 +22,11 @@ import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-list
 import * as sessionListingModule from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	readSessionOwner,
+	SessionOwnedError,
+	SessionOwnership,
+} from "@oh-my-pi/pi-coding-agent/session/session-owner-lease";
 import { getProjectDir, normalizePathForComparison, setProjectDir } from "@oh-my-pi/pi-utils";
 
 function buildArgs(resume: string, sessionDir?: string): Args {
@@ -480,12 +485,19 @@ describe("createSessionManager — cross-project --resume relocation (moved work
 			session: sessionInfo,
 		});
 
-		const movePrompt = vi.fn(async () => "accepted" as const);
+		const ownership = new SessionOwnership({ agentDir: missingRoot });
+		const movePrompt = vi.fn(async () => {
+			expect(readSessionOwner(oldFile, { agentDir: missingRoot })?.state).toBe("active");
+			const competing = new SessionOwnership({ agentDir: missingRoot });
+			expect(() => competing.claimInitial(oldFile)).toThrow(SessionOwnedError);
+			return "accepted" as const;
+		});
 		const result = await createSessionManager(
 			buildArgs(resumePrefix, explicitSessionDir),
 			currentProject,
 			stubSettings,
 			movePrompt,
+			ownership,
 		);
 
 		if (!result) throw new Error("Expected moved session manager");
@@ -502,6 +514,7 @@ describe("createSessionManager — cross-project --resume relocation (moved work
 			);
 			expect(header?.cwd).toBe(path.resolve(currentProject));
 		} finally {
+			ownership.release();
 			await result.close();
 		}
 		expect(movePrompt).toHaveBeenCalledTimes(1);

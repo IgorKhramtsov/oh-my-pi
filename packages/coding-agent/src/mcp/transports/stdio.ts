@@ -7,6 +7,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { Process } from "@oh-my-pi/pi-natives";
 import { getProjectDir, readJsonl } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import { hostHasInheritableConsole } from "../../eval/py/spawn-options";
@@ -495,24 +496,12 @@ function signalStdioProcess(
 }
 
 /**
- * Terminate an MCP stdio subprocess: SIGTERM (process-group when `detached`
- * on POSIX, direct child otherwise), wait up to `termGraceMs` for a
- * cooperative exit, then escalate to SIGKILL — waiting up to `KILL_GRACE_MS`
- * more only when the leader itself hadn't already exited. A detached
- * leader's cooperative exit does not prove the whole process group is gone
- * (a grandchild can outlive it and ignore SIGTERM), so detached transports
- * always fire the group SIGKILL sweep, even after a clean SIGTERM exit.
- * Every step is a no-op-safe signal against an already-exited target, so
- * repeat calls (idempotent `close()`) never throw.
+ * Terminate an MCP stdio process tree. macOS uses the native stable process
+ * handle because MCP children must remain attached for TCC and therefore have
+ * no dedicated process group. Other POSIX platforms use the detached group;
+ * the direct-child path remains the final fallback.
  *
- * Exported so tests can exercise group-signal escalation with an explicit
- * `detached`/`platform` pair: `StdioTransport.connect()` derives `detached`
- * from `resolveStdioSpawnCommand()`, which is tied to the host's real
- * `process.platform`, so a POSIX detached session cannot be reproduced
- * end-to-end through `connect()` on a non-Linux dev/CI host. `termGraceMs`
- * preserves the production grace by default while allowing those real
- * subprocess tests to cover the same transition without sleeping for a
- * production-length shutdown window.
+ * Exported for real subprocess tests with explicit platform and grace values.
  */
 export async function terminateStdioProcess(
 	proc: KillableSubprocess,
@@ -520,6 +509,13 @@ export async function terminateStdioProcess(
 	platform: NodeJS.Platform = process.platform,
 	termGraceMs = TERM_GRACE_MS,
 ): Promise<void> {
+	if (platform === "darwin") {
+		const processRef = Process.fromPid(proc.pid);
+		if (processRef) {
+			await processRef.terminate({ group: detached, gracefulMs: termGraceMs, timeoutMs: KILL_GRACE_MS });
+			return;
+		}
+	}
 	signalStdioProcess(proc, detached, "SIGTERM", platform);
 	const exitedOnTerm = await waitForProcessExit(proc.exited, termGraceMs);
 	// A non-detached transport has no process group beyond the leader itself:

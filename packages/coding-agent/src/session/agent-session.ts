@@ -357,6 +357,7 @@ import {
 import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
+import type { SessionOwnership, SessionOwnershipTransition } from "./session-owner-lease";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
@@ -587,6 +588,7 @@ export class AgentSession {
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
 	#sessionChangeCallbacks = new Set<() => void>();
 	#observedSessionId: string | undefined;
+	#sessionOwnership: SessionOwnership | undefined;
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
@@ -1988,6 +1990,40 @@ export class AgentSession {
 				sessionFile: this.sessionFile,
 				error: String(error),
 			});
+		}
+	}
+
+	setSessionOwnership(ownership: SessionOwnership | undefined): void {
+		this.#sessionOwnership = ownership;
+	}
+
+	async #transitionSession<T>(operation: (beforeExpose: (sessionFile: string) => void) => T | Promise<T>): Promise<T> {
+		let reservedTarget = false;
+		let reservedSessionFile: string | undefined;
+		let transition: SessionOwnershipTransition | undefined;
+		const beforeExpose = (sessionFile: string): void => {
+			if (reservedTarget) throw new Error("Session transition already reserved a target");
+			reservedTarget = true;
+			reservedSessionFile = sessionFile;
+			transition = this.#sessionOwnership?.beginTransition(sessionFile);
+		};
+		try {
+			const result = await operation(beforeExpose);
+			transition?.commit();
+			return result;
+		} catch (error) {
+			const currentSessionFile = this.sessionManager.getSessionFile();
+			if (
+				transition &&
+				reservedSessionFile &&
+				currentSessionFile &&
+				path.resolve(currentSessionFile) === path.resolve(reservedSessionFile)
+			) {
+				transition.commit();
+			} else {
+				transition?.rollback();
+			}
+			throw error;
 		}
 	}
 
@@ -4618,6 +4654,8 @@ export class AgentSession {
 		// closes the writer.
 		this.sessionManager.seal();
 		await this.sessionManager.close();
+		this.#sessionOwnership?.release();
+		this.#sessionOwnership = undefined;
 
 		// Release retained conversation memory. dispose() is terminal, and every
 		// revival path reopens the transcript from disk (AgentLifecycleManager
@@ -7600,10 +7638,15 @@ export class AgentSession {
 				} else {
 					await this.sessionManager.flush();
 				}
-				await this.sessionManager.newSession({
-					...options,
-					additionalDirectories: this.settings.get("workspace.additionalDirectories"),
-				});
+				await this.#transitionSession(beforeExpose =>
+					this.sessionManager.newSession(
+						{
+							...options,
+							additionalDirectories: this.settings.get("workspace.additionalDirectories"),
+						},
+						beforeExpose,
+					),
+				);
 				this.#bash.markSessionTransition(bashTransition);
 				// The new session owns the transcript from here, so the previous
 				// conversation's advisor spend is retired with it. Clearing at the commit
@@ -7722,7 +7765,7 @@ export class AgentSession {
 			// Fork the session (creates new session file with same entries)
 			let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
 			try {
-				forkResult = await this.sessionManager.fork();
+				forkResult = await this.#transitionSession(beforeExpose => this.sessionManager.fork(beforeExpose));
 			} catch (error) {
 				this.#bash.finishSessionTransition(bashTransition, false);
 				throw error;
@@ -7766,7 +7809,7 @@ export class AgentSession {
 	/** Move the active session and artifacts after enforcing mode transition invariants. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
-		await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		await this.#transitionSession(beforeExpose => this.sessionManager.moveTo(newCwd, targetSessionDir, beforeExpose));
 	}
 
 	// =========================================================================
@@ -8711,6 +8754,18 @@ export class AgentSession {
 			preserveLocalCwd?: boolean;
 		},
 	): Promise<boolean> {
+		return this.#sessionOwnership
+			? this.#sessionOwnership.switchTo(sessionPath, () => this.#switchSession(sessionPath, options))
+			: this.#switchSession(sessionPath, options);
+	}
+
+	async #switchSession(
+		sessionPath: string,
+		options?: {
+			onCwdChange?: (newCwd: string, previousCwd: string) => Promise<boolean>;
+			preserveLocalCwd?: boolean;
+		},
+	): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -9117,14 +9172,16 @@ export class AgentSession {
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
-				if (!selectedEntry.parentId) {
-					const title = this.sessionManager.getSessionName();
-					const titleSource = this.sessionManager.titleSource;
-					await this.sessionManager.newSession({ parentSession: previousSessionFile });
-					if (title) await this.sessionManager.setSessionName(title, titleSource);
-				} else {
-					this.sessionManager.createBranchedSession(selectedEntry.parentId);
-				}
+				await this.#transitionSession(async beforeExpose => {
+					if (!selectedEntry.parentId) {
+						const title = this.sessionManager.getSessionName();
+						const titleSource = this.sessionManager.titleSource;
+						await this.sessionManager.newSession({ parentSession: previousSessionFile }, beforeExpose);
+						if (title) await this.sessionManager.setSessionName(title, titleSource);
+					} else {
+						this.sessionManager.createBranchedSession(selectedEntry.parentId, beforeExpose);
+					}
+				});
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
@@ -9248,7 +9305,9 @@ export class AgentSession {
 				if (this.sessionManager.getSessionId() !== sessionId || this.sessionManager.getLeafId() !== leafId) {
 					throw new Error("Cannot branch /btw: session changed since /btw started");
 				}
-				this.sessionManager.createBranchedSession(leafId);
+				await this.#transitionSession(beforeExpose => {
+					this.sessionManager.createBranchedSession(leafId, beforeExpose);
+				});
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;

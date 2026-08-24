@@ -11,6 +11,7 @@ interface BtwRequest {
 	question: string;
 	leafId: string | null;
 	sessionId: string;
+	running: boolean;
 }
 
 function assistantMessageWithReplyText(assistantMessage: AssistantMessage, replyText: string): AssistantMessage {
@@ -46,9 +47,12 @@ export class BtwController {
 	#copyInFlight = false;
 
 	constructor(private readonly ctx: InteractiveModeContext) {}
-
 	hasActiveRequest(): boolean {
 		return this.#activeRequest !== undefined;
+	}
+
+	hasRunningRequest(): boolean {
+		return this.#activeRequest?.running === true;
 	}
 
 	canBranch(): boolean {
@@ -169,6 +173,7 @@ export class BtwController {
 			question: trimmedQuestion,
 			leafId: this.ctx.sessionManager.getLeafId(),
 			sessionId: this.ctx.sessionManager.getSessionId(),
+			running: true,
 		};
 		this.ctx.btwContainer.clear();
 		this.ctx.btwContainer.addChild(request.component);
@@ -215,6 +220,8 @@ export class BtwController {
 				return;
 			}
 			request.component.markError(error instanceof Error ? error.message : String(error));
+		} finally {
+			request.running = false;
 		}
 	}
 

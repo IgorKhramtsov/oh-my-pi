@@ -282,6 +282,7 @@ class SessionList implements Component {
 	#allSessions: SessionInfo[];
 	#showCwd: boolean;
 	#pinnedIds: ReadonlySet<string>;
+	#parkedSessionPaths: ReadonlySet<string>;
 	readonly #historyMatcher?: SessionHistoryMatcher;
 	#historyMergeTimer: NodeJS.Timeout | undefined;
 	/** Re-render hook for async list updates (fuzzy scan chunks, history merge). */
@@ -313,13 +314,15 @@ class SessionList implements Component {
 		historyMatcher?: SessionHistoryMatcher,
 		getTerminalRows: () => number = () => 24,
 		pinnedIds: ReadonlySet<string> = new Set(),
+		parkedSessionPaths: ReadonlySet<string> = new Set(),
 	) {
 		this.#getTerminalRows = getTerminalRows;
-		this.#allSessions = sessions;
 		this.#showCwd = showCwd;
 		this.#pinnedIds = pinnedIds;
+		this.#parkedSessionPaths = parkedSessionPaths;
+		this.#allSessions = this.#orderSessions(sessions);
 		this.#historyMatcher = historyMatcher;
-		this.#filteredSessions = sessions;
+		this.#filteredSessions = this.#allSessions;
 		this.#searchInput = new Input();
 
 		// Handle Enter in search input - select current item
@@ -355,12 +358,36 @@ class SessionList implements Component {
 	}
 
 	/** Replace the visible dataset, e.g. when toggling folder/all-projects scope. */
-	setSessions(sessions: SessionInfo[], showCwd: boolean, pinnedIds?: ReadonlySet<string>): void {
-		this.#allSessions = sessions;
+	setSessions(
+		sessions: SessionInfo[],
+		showCwd: boolean,
+		pinnedIds?: ReadonlySet<string>,
+		parkedSessionPaths?: ReadonlySet<string>,
+	): void {
 		this.#showCwd = showCwd;
 		if (pinnedIds !== undefined) this.#pinnedIds = pinnedIds;
+		if (parkedSessionPaths !== undefined) this.#parkedSessionPaths = parkedSessionPaths;
+		this.#allSessions = this.#orderSessions(sessions);
 		this.#selectedIndex = 0;
 		this.#filterSessions(this.#searchInput.getValue());
+	}
+
+	#groupName(session: SessionInfo): "Favorites" | "Parked" | "Other" {
+		if (this.#pinnedIds.has(session.id)) return "Favorites";
+		if (this.#parkedSessionPaths.has(session.path)) return "Parked";
+		return "Other";
+	}
+
+	#orderSessions(sessions: SessionInfo[]): SessionInfo[] {
+		const favorites: SessionInfo[] = [];
+		const parked: SessionInfo[] = [];
+		const other: SessionInfo[] = [];
+		for (const session of sessions) {
+			if (this.#pinnedIds.has(session.id)) favorites.push(session);
+			else if (this.#parkedSessionPaths.has(session.path)) parked.push(session);
+			else other.push(session);
+		}
+		return [...favorites, ...parked, ...other];
 	}
 
 	#filterSessions(query: string): void {
@@ -444,8 +471,9 @@ class SessionList implements Component {
 		const base: SessionInfo[] = [];
 		for (const match of this.#literalRanked) base.push(match.session);
 		for (const match of this.#fuzzyRanked) base.push(match.session);
-		this.#filteredSessions =
+		const ranked =
 			this.#historyIds.length > 0 ? mergeSessionRanking(this.#allSessions, base, this.#historyIds) : base;
+		this.#filteredSessions = this.#orderSessions(ranked);
 		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, this.#filteredSessions.length - 1));
 	}
 
@@ -569,32 +597,39 @@ class SessionList implements Component {
 		// worst-case count-based window would leave (then padded by
 		// fill-height).
 		const filtered = this.#filteredSessions;
-		const itemHeight = (session: SessionInfo): number => (session.title ? 4 : 3);
+		const itemHeight = (session: SessionInfo, index: number): number => {
+			const startsGroup = index === 0 || this.#groupName(filtered[index - 1]!) !== this.#groupName(session);
+			return (session.title ? 4 : 3) + (startsGroup ? 1 : 0);
+		};
 		const budget = this.#lineBudget();
 		let startIndex = this.#selectedIndex;
 		let endIndex = this.#selectedIndex + 1;
-		let used = itemHeight(filtered[this.#selectedIndex]!);
+		let used = itemHeight(filtered[this.#selectedIndex]!, this.#selectedIndex);
 		// Alternate growth below/above the selection to keep it roughly centered.
 		for (let preferDown = true; ; preferDown = !preferDown) {
-			const canDown = endIndex < filtered.length && used + itemHeight(filtered[endIndex]!) <= budget;
-			const canUp = startIndex > 0 && used + itemHeight(filtered[startIndex - 1]!) <= budget;
+			const canDown = endIndex < filtered.length && used + itemHeight(filtered[endIndex]!, endIndex) <= budget;
+			const canUp = startIndex > 0 && used + itemHeight(filtered[startIndex - 1]!, startIndex - 1) <= budget;
 			if (!canDown && !canUp) break;
 			if (canDown && (preferDown || !canUp)) {
-				used += itemHeight(filtered[endIndex]!);
+				used += itemHeight(filtered[endIndex]!, endIndex);
 				endIndex++;
 			} else {
 				startIndex--;
-				used += itemHeight(filtered[startIndex]!);
+				used += itemHeight(filtered[startIndex]!, startIndex);
 			}
 		}
 
 		// Each session block is built into sessionLines, then wrapped by ScrollView
 		// so the right-edge scrollbar is proportional at the physical-line level.
 		const sessionLines: string[] = [];
-		const sessionRowIndex: number[] = [];
+		const sessionRowIndex: (number | undefined)[] = [];
 		const overflow = startIndex > 0 || endIndex < filtered.length;
 		const rowWidth = Math.max(0, width - (overflow ? 1 : 0));
 		for (let i = startIndex; i < endIndex; i++) {
+			if (i === 0 || this.#groupName(filtered[i - 1]!) !== this.#groupName(filtered[i]!)) {
+				sessionLines.push(theme.fg("accent", this.#groupName(filtered[i]!)));
+				sessionRowIndex.push(undefined);
+			}
 			const blockStart = sessionLines.length;
 			const session = this.#filteredSessions[i];
 			const isSelected = i === this.#selectedIndex;
@@ -661,7 +696,7 @@ class SessionList implements Component {
 		let offsetRows = 0;
 		for (let i = 0; i < filtered.length; i++) {
 			if (i === startIndex) offsetRows = totalRows;
-			totalRows += itemHeight(filtered[i]!);
+			totalRows += itemHeight(filtered[i]!, i);
 		}
 		// The last session's separator blank is never rendered (see the block
 		// loop above), so exclude it or a fully visible list would still show a
@@ -782,6 +817,8 @@ export interface SessionSelectorOptions {
 	fillHeight?: boolean;
 	/** Set of pinned session ids to display with a pin indicator. */
 	pinnedIds?: ReadonlySet<string>;
+	/** Session files currently held by live parked launchers. */
+	parkedSessionPaths?: ReadonlySet<string>;
 }
 
 /**
@@ -852,6 +889,7 @@ export class SessionSelectorComponent extends OverlayPanel {
 			options.historyMatcher,
 			options.getTerminalRows,
 			options.pinnedIds,
+			options.parkedSessionPaths,
 		);
 		// Every exit path cancels the list's pending history merge, so a stale
 		// debounce timer can never run its SQLite lookup after the picker closed.

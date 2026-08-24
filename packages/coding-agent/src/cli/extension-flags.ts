@@ -42,3 +42,13 @@ export function applyExtensionFlags(runner: ExtensionFlagSink | undefined, rawAr
 	}
 	return parsed;
 }
+
+/** Replay already-validated extension flags restored from a parked handoff. */
+export function applyPersistedExtensionFlags(runner: ExtensionFlagSink | undefined, parsed: Args): Args {
+	if (!runner) return parsed;
+	for (const [name, value] of parsed.unknownFlags) {
+		if (!runner.getFlags().has(name)) throw new Error(`Parked extension flag is no longer registered: --${name}`);
+		runner.setFlagValue(name, value);
+	}
+	return parsed;
+}

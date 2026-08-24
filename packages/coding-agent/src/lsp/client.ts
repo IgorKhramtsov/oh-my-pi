@@ -5,6 +5,7 @@ import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
 import { connectSharedLspTransport } from "./mux/daemon";
+import { MUX_RELEASE_METHOD } from "./mux/protocol";
 import type {
 	LspClient,
 	LspJsonRpcId,
@@ -1491,7 +1492,10 @@ async function waitForExit(client: LspClient, timeoutMs: number): Promise<boolea
  * the shutdown budget — callers reporting a restart must treat `false` as a
  * failed teardown, not a completed restart.
  */
-export async function shutdownClientInstance(client: LspClient): Promise<boolean> {
+export async function shutdownClientInstance(
+	client: LspClient,
+	options?: { retainSharedServer?: boolean },
+): Promise<boolean> {
 	if (clients.get(client.name) === client) clients.delete(client.name);
 
 	const err = new Error("LSP client shutdown");
@@ -1499,6 +1503,9 @@ export async function shutdownClientInstance(client: LspClient): Promise<boolean
 		pending.reject(err);
 	}
 	client.pendingRequests.clear();
+	if (client.proc.sharedMux && options?.retainSharedServer === false) {
+		await sendNotification(client, MUX_RELEASE_METHOD, undefined).catch(() => {});
+	}
 
 	const shutdownCompleted = await sendRequest(client, "shutdown", null, undefined, SHUTDOWN_TIMEOUT_MS).then(
 		() => true,
@@ -1666,7 +1673,7 @@ export async function sendNotification(
 /**
  * Shutdown all LSP clients.
  */
-export async function shutdownAll(): Promise<void> {
+export async function shutdownAll(options?: { retainSharedServers?: boolean }): Promise<void> {
 	stopIdleChecker();
 	invalidatedClientKeys.clear();
 	clientReloadBarriers.clear();
@@ -1679,12 +1686,14 @@ export async function shutdownAll(): Promise<void> {
 	clientLocks.clear();
 	const seen = new Set<LspClient>(clientsToShutdown);
 	await Promise.allSettled([
-		...clientsToShutdown.map(client => shutdownClientInstance(client)),
+		...clientsToShutdown.map(client =>
+			shutdownClientInstance(client, { retainSharedServer: options?.retainSharedServers }),
+		),
 		...pendingClients.map(pending =>
 			pending.then(client => {
 				if (seen.has(client)) return;
 				seen.add(client);
-				return shutdownClientInstance(client);
+				return shutdownClientInstance(client, { retainSharedServer: options?.retainSharedServers });
 			}),
 		),
 	]);

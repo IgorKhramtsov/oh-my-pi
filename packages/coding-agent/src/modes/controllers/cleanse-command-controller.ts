@@ -36,6 +36,10 @@ export class CleanseCommandController {
 		return this.#active !== undefined;
 	}
 
+	hasRunningRun(): boolean {
+		return this.#active?.settled === false;
+	}
+
 	/** Esc while running cancels the run; Esc on a settled panel dismisses it. */
 	handleEscape(): boolean {
 		const run = this.#active;

@@ -67,6 +67,9 @@ export const MUX_PING_RESULT = "pong";
  */
 export const MUX_RESTART_METHOD = "omp/muxRestartServer";
 
+/** Notification before exit: stop the server immediately when this is its last link. */
+export const MUX_RELEASE_METHOD = "omp/muxReleaseServer";
+
 /** Handshake parameters identifying a reusable server process. */
 export interface MuxConnectParams {
 	/** Executable to spawn (the client's `resolvedCommand ?? command`). */

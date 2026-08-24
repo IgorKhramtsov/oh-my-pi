@@ -6,6 +6,7 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
@@ -25,7 +26,7 @@ import {
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
-import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
+import { applyExtensionFlags, applyPersistedExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
@@ -60,9 +61,10 @@ import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
+import { shutdownAll as shutdownLspClients } from "./lsp/client";
 import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
-import { InteractiveMode } from "./modes/interactive-mode";
+import { InteractiveMode, type InteractiveModeOptions } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
@@ -97,8 +99,21 @@ import {
 	persistForeignSession,
 } from "./session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
+import { loadParkLauncherClient } from "./session/park-launcher-client";
+import { writeParkHandoff } from "./session/parking-handoff";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
+import {
+	claimParkedSession,
+	markParkedSession,
+	readSessionOwner,
+	reclaimParkedSession,
+	SessionOwnedError,
+	SessionOwnership,
+	type SessionOwnershipTransition,
+	sessionOwnerIsLive,
+} from "./session/session-owner-lease";
+import { FileSessionStorage } from "./session/session-storage";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
@@ -501,6 +516,7 @@ async function runInteractiveMode(
 	joinLink?: string,
 	startBackgroundModelDiscovery?: () => Promise<void>,
 	startupLease?: ComposerLease,
+	parking?: InteractiveModeOptions["parking"],
 ): Promise<void> {
 	let mode: InteractiveMode;
 	try {
@@ -514,6 +530,7 @@ async function runInteractiveMode(
 			eventBus,
 			startupLease?.composer,
 			subagentEventBus,
+			parking,
 		);
 		startupLease?.adopt();
 	} catch (error) {
@@ -705,6 +722,7 @@ async function moveMissingCwdSessionIfNeeded(
 	cwd: string,
 	sessionDir: string | undefined,
 	askToMoveSession: SessionPrompt,
+	ownership?: SessionOwnership,
 ): Promise<MissingCwdMoveResult> {
 	const sourceCwd = session.cwd;
 	if (!sourceCwd || fsSync.existsSync(sourceCwd)) {
@@ -726,7 +744,16 @@ async function moveMissingCwdSessionIfNeeded(
 	// move target equals the current project dir. moveTo never chdirs, so the
 	// stale cwd is only a relocation source, not a directory we enter.
 	const manager = await SessionManager.open(session.path, sessionDir, undefined, { initialCwd: sourceCwd });
-	await manager.moveTo(cwd, sessionDir);
+	let transition: SessionOwnershipTransition | undefined;
+	try {
+		await manager.moveTo(cwd, sessionDir, target => {
+			transition = ownership ? beginSessionOwnershipTransition(ownership, target) : undefined;
+		});
+		transition?.commit();
+	} catch (error) {
+		transition?.rollback();
+		throw error;
+	}
 	return { status: "moved", manager };
 }
 
@@ -937,20 +964,83 @@ export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly st
 	parsed.messages.splice(messageIndex, 1);
 }
 
+function rejectLiveSessionOwner(sessionFile: string): void {
+	const owner = readSessionOwner(sessionFile);
+	if (!owner || !sessionOwnerIsLive(owner)) return;
+	const error = new SessionOwnedError(owner);
+	throw new SessionResolutionError(error.message, error.focused ? undefined : "Resume it from its existing owner.");
+}
+
+function beginSessionOwnershipTransition(ownership: SessionOwnership, sessionFile: string): SessionOwnershipTransition {
+	try {
+		return ownership.beginTransition(sessionFile);
+	} catch (error) {
+		if (error instanceof SessionOwnedError) {
+			throw new SessionResolutionError(
+				error.message,
+				error.focused ? undefined : "Resume it from its existing owner.",
+			);
+		}
+		throw error;
+	}
+}
+
+function claimInitialSessionOwnership(ownership: SessionOwnership, sessionFile: string, parkToken?: string): void {
+	try {
+		ownership.claimInitial(sessionFile, parkToken);
+	} catch (error) {
+		if (error instanceof SessionOwnedError) {
+			throw new SessionResolutionError(
+				error.message,
+				error.focused ? undefined : "Resume it from its existing owner.",
+			);
+		}
+		throw error;
+	}
+}
+
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
 export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	activeSettings: Settings = settings,
 	askToMoveSession: SessionPrompt = promptMoveSession,
+	ownership?: SessionOwnership,
 ): Promise<SessionManager | undefined> {
+	const claimManager = (manager: SessionManager, token?: string): SessionManager => {
+		const sessionFile = manager.getSessionFile();
+		if (sessionFile && ownership && !ownership.claimed) {
+			claimInitialSessionOwnership(ownership, sessionFile, token);
+		}
+		return manager;
+	};
+	const continueRecent = async (): Promise<SessionManager> => {
+		let transition: SessionOwnershipTransition | undefined;
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir, new FileSessionStorage(), {
+			beforeMove: sourceSessionFile => {
+				if (ownership && !ownership.claimed) {
+					claimInitialSessionOwnership(ownership, sourceSessionFile);
+				}
+			},
+			beforeExpose: targetSessionFile => {
+				transition = ownership ? beginSessionOwnershipTransition(ownership, targetSessionFile) : undefined;
+			},
+			onCommitted: () => transition?.commit(),
+			onFailure: () => transition?.rollback(),
+		});
+		return claimManager(manager);
+	};
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new SessionResolutionError("--fork requires session persistence");
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
+			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, new FileSessionStorage(), {
+				beforeExpose: sessionFile => {
+					if (ownership) claimInitialSessionOwnership(ownership, sessionFile);
+				},
+			});
 		}
 		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
 		if (!match) {
@@ -959,7 +1049,11 @@ export async function createSessionManager(
 				"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.",
 			);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, new FileSessionStorage(), {
+			beforeExpose: sessionFile => {
+				if (ownership) claimInitialSessionOwnership(ownership, sessionFile);
+			},
+		});
 	}
 
 	if (parsed.noSession) {
@@ -970,7 +1064,17 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(sessionArg, parsed.sessionDir);
+			if (!parsed.strictResume) rejectLiveSessionOwner(sessionArg);
+			const manager = await SessionManager.open(sessionArg, parsed.sessionDir, undefined, {
+				mustExist: parsed.strictResume,
+			});
+			if (parsed.strictResume) {
+				if (!parsed.parkToken || !claimParkedSession(sessionArg, parsed.parkToken, process.pid)) {
+					await manager.close();
+					throw new SessionResolutionError("Parked session reservation is no longer available");
+				}
+			}
+			return claimManager(manager, parsed.parkToken);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
 		if (!match) {
@@ -979,59 +1083,36 @@ export async function createSessionManager(
 				"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.",
 			);
 		}
-		if (match.scope === "local") {
-			const moveResult = await moveMissingCwdSessionIfNeeded(
-				sessionArg,
-				match.session,
-				cwd,
-				parsed.sessionDir,
-				askToMoveSession,
-			);
-			if (moveResult.status === "moved") {
-				return moveResult.manager;
-			}
-			if (moveResult.status === "declined") {
-				return undefined;
-			}
-		}
-		if (match.scope === "global") {
-			const moveResult = await moveMissingCwdSessionIfNeeded(
-				sessionArg,
-				match.session,
-				cwd,
-				parsed.sessionDir,
-				askToMoveSession,
-			);
-			if (moveResult.status === "moved") {
-				return moveResult.manager;
-			}
-			if (moveResult.status === "declined") {
-				return undefined;
-			}
+		rejectLiveSessionOwner(match.session.path);
+		if (ownership) claimInitialSessionOwnership(ownership, match.session.path);
+		const moveResult = await moveMissingCwdSessionIfNeeded(
+			sessionArg,
+			match.session,
+			cwd,
+			parsed.sessionDir,
+			askToMoveSession,
+			ownership,
+		);
+		if (moveResult.status === "moved") return moveResult.manager;
+		if (moveResult.status === "declined") {
+			ownership?.release();
+			return undefined;
 		}
 		return await SessionManager.open(match.session.path, parsed.sessionDir);
 	}
-	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
-	}
-	// --resume without value is handled separately (needs picker UI)
-	// If --session-dir provided without --continue/--resume, create new session there
-	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, parsed.sessionDir);
-	}
+	if (parsed.continue) return await continueRecent();
 	// Auto-resume: behave like --continue if the setting is enabled and a prior
 	// session exists. When a prior session is resumed, mark parsed.continue so
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await continueRecent();
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
-		return manager;
+		return claimManager(manager);
 	}
-	// Default case (new session) returns undefined, SDK will create one
-	return undefined;
+	return claimManager(SessionManager.create(cwd, parsed.sessionDir));
 }
 
 /** Discover SYSTEM.md file if no CLI system prompt was provided */
@@ -1402,6 +1483,7 @@ export async function runRootCommand(
 ): Promise<void> {
 	logger.startTiming();
 	startStartupWatchdog();
+	let sessionOwnership: SessionOwnership | undefined;
 	try {
 		// Non-prepaint commands still need a default theme; an existing Composer
 		// already initialized its cached theme synchronously for the first frame.
@@ -1443,6 +1525,7 @@ export async function runRootCommand(
 			process.exit(1);
 		}
 		const mode = parsedArgs.mode || "text";
+		if (mode !== "acp") sessionOwnership = new SessionOwnership();
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
 
@@ -1680,7 +1763,13 @@ export async function runRootCommand(
 						persistForeignSession,
 						store,
 						foreignSession,
-						{ fallbackCwd: cwd, sessionDir: parsedArgs.sessionDir },
+						{
+							fallbackCwd: cwd,
+							sessionDir: parsedArgs.sessionDir,
+							beforeExpose: sessionFile => {
+								if (sessionOwnership) claimInitialSessionOwnership(sessionOwnership, sessionFile);
+							},
+						},
 					);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
@@ -1693,6 +1782,8 @@ export async function runRootCommand(
 					parsedArgs,
 					cwd,
 					settingsInstance,
+					promptMoveSession,
+					sessionOwnership,
 				);
 			}
 		} catch (error: unknown) {
@@ -1775,6 +1866,8 @@ export async function runRootCommand(
 				stopStartupWatchdog();
 				process.exit(0);
 			}
+			rejectLiveSessionOwner(selected.path);
+			if (sessionOwnership) claimInitialSessionOwnership(sessionOwnership, selected.path);
 			sessionManager = await SessionManager.open(selected.path);
 			const previousCwd = cwd;
 			const recordedCwd = selected.cwd || sessionManager.getRecordedCwd() || sessionManager.getCwd();
@@ -1792,6 +1885,12 @@ export async function runRootCommand(
 			}
 		}
 
+		if (mode !== "acp") {
+			const sessionFile = sessionManager?.getSessionFile();
+			if (sessionFile && sessionOwnership && !sessionOwnership.claimed) {
+				claimInitialSessionOwnership(sessionOwnership, sessionFile, parsedArgs.parkToken);
+			}
+		}
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
 			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());
 			if (pendingToolWarning) {
@@ -1901,7 +2000,9 @@ export async function runRootCommand(
 					extensionsResult.runtime.flagValues.set(name, value);
 				},
 			};
-			const initialArgs = applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs;
+			const initialArgs = parsedArgs.strictResume
+				? applyPersistedExtensionFlags(extensionFlagSink, parsedArgs)
+				: (applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs);
 			normalizeContinueSessionArgs(initialArgs, rawArgs);
 			if ((parsedArgs.trustedExtensions?.length ?? 0) > 0 && extensionsResult.errors.length > 0) {
 				throw new Error(
@@ -1974,6 +2075,7 @@ export async function runRootCommand(
 				subagentEventBus,
 				preloadedExtensions: extensionsResult,
 			});
+			session.setSessionOwnership(sessionOwnership);
 
 			try {
 				validateToolNames(initialArgs.tools, session.getAllToolNames());
@@ -2068,6 +2170,54 @@ export async function runRootCommand(
 						process.exit(0);
 					}
 				}
+				const parkLauncher = await loadParkLauncherClient();
+				if (parkLauncher && parsedArgs.parkToken && parsedArgs.parkToken !== parkLauncher.token) {
+					throw new Error("Parked session token does not match the pane launcher");
+				}
+				const parkingIdleMs = Math.max(0, settingsInstance.get("parking.idleSeconds")) * 1000;
+				const parkingWarningMs = 10_000;
+				const parking: InteractiveModeOptions["parking"] =
+					parkLauncher && parkingIdleMs > 0
+						? {
+								idleMs: parkingIdleMs,
+								warningMs: parkingWarningMs,
+								park: async (draft, signal) => {
+									signal.throwIfAborted();
+									await session.sessionManager.ensureOnDisk();
+									signal.throwIfAborted();
+									await session.sessionManager.saveDraft(draft);
+									signal.throwIfAborted();
+									const state = await writeParkHandoff(
+										parkLauncher.handoffDir,
+										initialArgs,
+										session.sessionManager,
+										parkLauncher.token,
+									);
+									signal.throwIfAborted();
+									if (
+										!markParkedSession(state.sessionFile, state.token, parkLauncher.handoffDir, state.title)
+									) {
+										throw new Error("Could not reserve the session for parked resume");
+									}
+									try {
+										await parkLauncher.publish(path.join(parkLauncher.handoffDir, "state.json"), signal);
+									} catch (error) {
+										if (!reclaimParkedSession(state.sessionFile, state.token, process.pid)) {
+											throw new Error("Parking failed and the active session lease could not be restored", {
+												cause: error,
+											});
+										}
+										sessionOwnership?.adoptCurrentToken(state.sessionFile, state.token);
+										throw error;
+									}
+									await shutdownLspClients({ retainSharedServers: false }).catch(error => {
+										logger.warn("Failed to release LSP clients while parking", { error: String(error) });
+									});
+									return true;
+								},
+							}
+						: undefined;
+
 				const startupLease = takeStartupComposerLease();
 				try {
 					stopStartupWatchdog();
@@ -2092,6 +2242,7 @@ export async function runRootCommand(
 						parsedArgs.join,
 						startBackgroundModelDiscovery,
 						startupLease,
+						parking,
 					);
 				} finally {
 					startupLease?.dispose();
@@ -2120,6 +2271,8 @@ export async function runRootCommand(
 		stopPendingStartupComposer();
 		stopStartupWatchdog();
 		throw error;
+	} finally {
+		sessionOwnership?.release();
 	}
 }
 

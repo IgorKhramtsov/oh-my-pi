@@ -55,6 +55,7 @@ import type { ForeignSessionInfo, ForeignSessionSource } from "../../session/for
 import type { SessionEntry, SessionMessageEntry, SessionTreeNode } from "../../session/session-entries";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
+import { listLiveParkedSessionPaths, withSessionDeletionLease } from "../../session/session-owner-lease";
 import { loadPinnedSessionIds } from "../../session/session-pins";
 import { FileSessionStorage } from "../../session/session-storage";
 import { type LogoutAccount, toLogoutAccounts } from "../../slash-commands/helpers/logout";
@@ -1792,8 +1793,10 @@ export class SelectorController {
 					}
 					const storage = new FileSessionStorage();
 					try {
-						await storage.deleteSessionWithArtifacts(session.path);
-						return true;
+						return await withSessionDeletionLease(session.path, async () => {
+							await storage.deleteSessionWithArtifacts(session.path);
+							return true;
+						});
 					} catch (error) {
 						throw new Error(
 							`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`,
@@ -1804,6 +1807,7 @@ export class SelectorController {
 				historyMatcher,
 				loadAllSessions: () => SessionManager.listAll(),
 				pinnedIds,
+				parkedSessionPaths: listLiveParkedSessionPaths(),
 			};
 		}
 
@@ -1934,7 +1938,6 @@ export class SelectorController {
 			return;
 		}
 
-		// Check if session file exists (may not exist for brand new sessions)
 		const storage = new FileSessionStorage();
 		const fileExists = await storage.exists(sessionFile);
 		if (!fileExists) {
@@ -1957,10 +1960,8 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		await withSessionDeletionLease(sessionFile, () => storage.deleteSessionWithArtifacts(sessionFile));
 
-		// Show session selector
 		this.ctx.showStatus("Session deleted");
 		await this.showSessionSelector();
 	}

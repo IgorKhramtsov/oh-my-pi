@@ -22,6 +22,19 @@ export async function loadPinnedSessionIds(agentDir: string = getAgentDir()): Pr
 	}
 }
 
+/** Set one session's pin state; returns whether it is pinned after the write. */
+export async function setSessionPinned(
+	sessionId: string,
+	value: boolean,
+	agentDir: string = getAgentDir(),
+): Promise<boolean> {
+	const pinned = await loadPinnedSessionIds(agentDir);
+	if (value) pinned.add(sessionId);
+	else pinned.delete(sessionId);
+	await Bun.write(path.join(agentDir, PINS_FILENAME), JSON.stringify([...pinned], null, "\t"));
+	return pinned.has(sessionId);
+}
+
 /** Toggle one session's pin and persist the set; returns the new pinned state. */
 export async function toggleSessionPin(sessionId: string, agentDir: string = getAgentDir()): Promise<boolean> {
 	const pinned = await loadPinnedSessionIds(agentDir);

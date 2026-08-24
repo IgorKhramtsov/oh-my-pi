@@ -61,6 +61,12 @@ describe("resolveCliArgv routes subcommands hidden behind leading global flags",
 			argv: ["gc", "--apply"],
 		});
 	});
+
+	test("`park` dispatches as an internal subcommand instead of an LLM prompt", () => {
+		expect(resolveCliArgv(["park", "favorite", "/tmp/state.json"])).toEqual({
+			argv: ["park", "favorite", "/tmp/state.json"],
+		});
+	});
 });
 
 describe("resolveCliArgv strips launch-global flags before non-launch subcommands (#8891)", () => {

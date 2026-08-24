@@ -88,3 +88,35 @@ describe("SessionSelectorComponent status labels", () => {
 		}
 	});
 });
+
+describe("SessionSelectorComponent session groups", () => {
+	it("orders favorites, live parked sessions, then remaining sessions", () => {
+		const favorite = createSession("favorite", "complete");
+		const parked = createSession("parked", "interrupted");
+		const other = createSession("other", "pending");
+		const selector = new SessionSelectorComponent(
+			[other, parked, favorite],
+			() => {},
+			() => {},
+			() => {},
+			{
+				getTerminalRows: () => 100,
+				pinnedIds: new Set([favorite.id]),
+				parkedSessionPaths: new Set([parked.path]),
+			},
+		);
+		const rendered = selector
+			.render(120)
+			.join("\n")
+			.replace(/\x1b\[[0-9;]*m/g, "");
+
+		const favoritesIndex = rendered.indexOf("Favorites");
+		const parkedIndex = rendered.indexOf("Parked");
+		const otherIndex = rendered.indexOf("Other");
+		expect(favoritesIndex).toBeLessThan(rendered.indexOf(favorite.title!));
+		expect(rendered.indexOf(favorite.title!)).toBeLessThan(parkedIndex);
+		expect(parkedIndex).toBeLessThan(rendered.indexOf(parked.title!));
+		expect(rendered.indexOf(parked.title!)).toBeLessThan(otherIndex);
+		expect(otherIndex).toBeLessThan(rendered.indexOf(other.title!));
+	});
+});

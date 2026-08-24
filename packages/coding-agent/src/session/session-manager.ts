@@ -1105,17 +1105,25 @@ export class SessionManager {
 		}
 	}
 
-	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
+	#resetToNewSession(
+		options?: NewSessionOptions,
+		forcedSessionFile?: string,
+		beforeExpose?: (sessionFile: string) => void,
+	): string | undefined {
+		const sessionId = mintSessionId();
+		const timestamp = nowIso();
+		const sessionFile = this.#persist
+			? (forcedSessionFile ?? path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${sessionId}.jsonl`))
+			: undefined;
+		if (sessionFile) beforeExpose?.(sessionFile);
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
-		this.#sessionId = mintSessionId();
+		this.#sessionId = sessionId;
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
 		this.#titleUpdatedAt = "";
 		this.#hasTitleSlot = true;
-
-		const timestamp = nowIso();
 		this.#header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -1151,14 +1159,8 @@ export class SessionManager {
 		this.#inMemoryArtifacts = null;
 		this.#inMemoryArtifactCounter = 0;
 
-		if (this.#persist) {
-			this.#sessionFile =
-				forcedSessionFile ??
-				path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
-			this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, true);
-		} else {
-			this.#sessionFile = undefined;
-		}
+		this.#sessionFile = sessionFile;
+		if (sessionFile) this.#rememberBreadcrumb(this.#cwd, sessionFile, true);
 
 		return this.#sessionFile;
 	}
@@ -1481,9 +1483,12 @@ export class SessionManager {
 	 * The durable empty boundary prevents a later process on another terminal
 	 * from selecting the previous conversation as the most recent session.
 	 */
-	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
+	async newSession(
+		options?: NewSessionOptions,
+		beforeExpose?: (sessionFile: string) => void,
+	): Promise<string | undefined> {
 		await this.#drainAndCloseWriter();
-		const sessionFile = this.#resetToNewSession(options);
+		const sessionFile = this.#resetToNewSession(options, undefined, beforeExpose);
 		await this.ensureOnDisk();
 		return sessionFile;
 	}
@@ -1502,7 +1507,9 @@ export class SessionManager {
 	 * Fork the current session into a new file with the same entries.
 	 * @returns the old and new session file paths, or undefined when not persisting.
 	 */
-	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+	async fork(
+		beforeExpose?: (sessionFile: string) => void,
+	): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.#persist || !this.#sessionFile) return undefined;
 
 		const oldSessionFile = this.#sessionFile;
@@ -1512,8 +1519,12 @@ export class SessionManager {
 		this.#reconcileSessionDirForFallback();
 
 		const timestamp = nowIso();
-		this.#sessionId = mintSessionId();
-		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
+		const sessionId = mintSessionId();
+		const sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${sessionId}.jsonl`);
+		beforeExpose?.(sessionFile);
+		this.#clearDiskError();
+		this.#sessionId = sessionId;
+		this.#sessionFile = sessionFile;
 		this.#header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -1542,8 +1553,15 @@ export class SessionManager {
 		return { oldSessionFile, newSessionFile: this.#sessionFile };
 	}
 
-	/** Move the session to a new working directory. */
-	async moveTo(newCwd: string, targetSessionDir?: string): Promise<void> {
+	/**
+	 * Move the session to a new working directory: relocate the session file and
+	 * artifacts on disk, update internal references, and rewrite the header cwd.
+	 */
+	async moveTo(
+		newCwd: string,
+		targetSessionDir?: string,
+		beforeExpose?: (sessionFile: string) => void,
+	): Promise<void> {
 		const resolvedCwd = path.resolve(newCwd);
 		const resolvedTargetDir = targetSessionDir ? path.resolve(targetSessionDir) : undefined;
 		const managedRoot = resolveManagedSessionRoot(this.#sessionDir, this.#cwd);
@@ -1578,6 +1596,8 @@ export class SessionManager {
 
 		try {
 			if (this.#persist && this.#sessionFile) {
+				const targetSessionFile = path.join(nextSessionDir, path.basename(this.#sessionFile));
+				beforeExpose?.(targetSessionFile);
 				this.#storage.ensureDirSync(nextSessionDir);
 				await this.#drainAndCloseWriter();
 				this.#clearDiskError();
@@ -1693,13 +1713,17 @@ export class SessionManager {
 
 	/** Persist this session's transcript as a newly identified OMP session. */
 	async persistCopy(
-		options?: { sessionDir?: string; suppressBreadcrumb?: boolean },
+		options?: {
+			sessionDir?: string;
+			suppressBreadcrumb?: boolean;
+			beforeExpose?: (sessionFile: string) => void;
+		},
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionManager> {
 		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
-		manager.#resetToNewSession();
+		manager.#resetToNewSession(undefined, undefined, options?.beforeExpose);
 		manager.#sessionName = this.#sessionName;
 		manager.#titleSource = this.#titleSource;
 		manager.#titleUpdatedAt = this.#titleUpdatedAt;
@@ -2719,7 +2743,7 @@ export class SessionManager {
 	 * Create a new session file containing only the path from root to `leafId`.
 	 * Returns the new file path, or undefined when not persisting.
 	 */
-	createBranchedSession(leafId: string): string | undefined {
+	createBranchedSession(leafId: string, beforeExpose?: (sessionFile: string) => void): string | undefined {
 		const sourceSessionFile = this.#sessionFile;
 		const branchPath = this.getBranch(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
@@ -2781,6 +2805,7 @@ export class SessionManager {
 			this.#rewriteRequired = false;
 			return undefined;
 		}
+		beforeExpose?.(newSessionFile);
 
 		this.#sessionFile = newSessionFile;
 		this.#rewriteSynchronously();
@@ -2850,6 +2875,7 @@ export class SessionManager {
 			suppressBreadcrumb?: boolean;
 			sessionFile?: string;
 			resetInheritedCost?: boolean;
+			beforeExpose?: (sessionFile: string) => void;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
@@ -2869,6 +2895,7 @@ export class SessionManager {
 				providerPromptCacheKey: sourceHeader?.providerPromptCacheKey ?? sourceHeader?.id,
 			},
 			options?.sessionFile,
+			options?.beforeExpose,
 		);
 		manager.#header.title = sourceHeader?.title;
 		manager.#header.titleSource = sourceHeader?.titleSource;
@@ -2914,10 +2941,13 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { initialCwd?: string; suppressBreadcrumb?: boolean },
+		options?: { initialCwd?: string; suppressBreadcrumb?: boolean; mustExist?: boolean },
 	): Promise<SessionManager> {
 		const loaded = await loadSessionFile(filePath, storage);
 		const header = loaded.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (options?.mustExist && !header) {
+			throw new Error(`Session file does not contain a valid session header: ${path.resolve(filePath)}`);
+		}
 		// Resume into the session's recorded cwd only when it is verifiably
 		// accessible. A deleted or permission-blocked (macOS TCC denial) project
 		// dir would make the constructor's #cwd — and the `setProjectDir` chdir
@@ -3022,6 +3052,12 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		moveHooks?: {
+			beforeMove?: (sourceSessionFile: string) => void;
+			beforeExpose?: (targetSessionFile: string) => void;
+			onCommitted?: () => void;
+			onFailure?: () => void;
+		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const resolvedCwd = path.resolve(cwd);
@@ -3083,7 +3119,14 @@ export class SessionManager {
 					const manager = await SessionManager.open(breadcrumb.sessionFile, undefined, storage, {
 						initialCwd: breadcrumbCwd,
 					});
-					await manager.moveTo(cwd, sessionDir);
+					try {
+						moveHooks?.beforeMove?.(breadcrumb.sessionFile);
+						await manager.moveTo(cwd, sessionDir, moveHooks?.beforeExpose);
+						moveHooks?.onCommitted?.();
+					} catch (error) {
+						moveHooks?.onFailure?.();
+						throw error;
+					}
 					return manager;
 				}
 

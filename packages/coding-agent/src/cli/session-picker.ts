@@ -4,6 +4,7 @@ import { SessionSelectorComponent } from "../modes/components/session-selector";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionInfo } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
+import { listLiveParkedSessionPaths, withSessionDeletionLease } from "../session/session-owner-lease";
 import { loadPinnedSessionIds } from "../session/session-pins";
 import { FileSessionStorage } from "../session/session-storage";
 
@@ -17,6 +18,7 @@ export interface SessionPickerOptions {
 	allowGlobalScope?: boolean;
 	historySearch?: boolean;
 	pinnedIds?: ReadonlySet<string>;
+	parkedSessionPaths?: ReadonlySet<string>;
 }
 
 /**
@@ -38,6 +40,7 @@ export async function selectSession(
 	// session-list prefix never sees. Best-effort: a missing/locked history.db
 	// must not break the picker.
 	const pinnedIds = options.pinnedIds ?? (await loadPinnedSessionIds());
+	const parkedSessionPaths = options.parkedSessionPaths ?? listLiveParkedSessionPaths();
 
 	let historyMatcher: ((query: string) => string[]) | undefined;
 	if (options.historySearch !== false) {
@@ -77,10 +80,11 @@ export async function selectSession(
 				onDelete:
 					options.allowDelete === false
 						? undefined
-						: async (session: SessionInfo) => {
-								await storage.deleteSessionWithArtifacts(session.path);
-								return true;
-							},
+						: (session: SessionInfo) =>
+								withSessionDeletionLease(session.path, async () => {
+									await storage.deleteSessionWithArtifacts(session.path);
+									return true;
+								}),
 				historyMatcher,
 				loadAllSessions: options.allowGlobalScope === false ? undefined : () => SessionManager.listAll(storage),
 				allSessions: options.allSessions,
@@ -90,6 +94,7 @@ export async function selectSession(
 				scopeLabel: options.scopeLabel,
 				showCwd: options.showCwd,
 				pinnedIds,
+				parkedSessionPaths,
 			},
 		);
 		return selector;
